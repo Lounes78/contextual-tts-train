@@ -146,6 +146,129 @@ def forward(self, tokens: torch.Tensor, tokens_mask: torch.Tensor):
     return loss
 
 
+
+def init_weights(model: nn.Module):
+    """
+    Initialize the weights of the model.
+    """
+    def _init_weights(m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Embedding):
+            nn.init.normal_(m.weight, mean=0.0, std=0.02)
+        elif isinstance(m, nn.Parameter):
+            nn.init.xavier_uniform_(m.data)
+    
+    model.apply(_init_weights)
+    nn.init.xavier_uniform_(model.audio_head) # Just to be sure :/
+    return model
+
+
+
+def load_model(model_name_or_checkpoint_path: Union[str, Path] = None, device: Union[str, torch.device] = 'cuda', decoder_loss_weight: float = 0.5) -> Model:
+    """
+    Load model, add forward method, and move to device.
+    """
+    if model_name_or_checkpoint_path is None or str(model_name_or_checkpoint_path).endswith(".pt"):
+        # Training from scratch or using local checkpoint
+        config = ModelArgs(
+            backbone_flavor=BACKBONE_FLAVOR,
+            decoder_flavor=DECODER_FLAVOR,
+            text_vocab_size=TEXT_VOCAB_SIZE,
+            audio_vocab_size=AUDIO_VOCAB_SIZE,
+            audio_num_codebooks=AUDIO_NUM_CODEBOOKS
+        )
+        model = Model(config)
+
+        if model_name_or_checkpoint_path:
+            print(f"Loading checkpoint from {model_name_or_checkpoint_path}")
+            state_dict = torch.load(model_name_or_checkpoint_path, map_location='cpu')['Model']
+            model.load_state_dict(state_dict)
+        else:
+            print('Initializing model from scratch')
+            model = init_weights(model)
+    else:
+        # Huggingface model name
+        print(f"Loading pretrained model: {model_name_or_checkpoint_path}")
+        model = Model.from_pretrained(model_name_or_checkpoint_path)
+    
+    model.decoder_loss_weight = decoder_loss_weight # This parameter balances the two different objectives the model is trained on simultaneously
+    model.forward = types.MethodType(forward, model) # add the forward method to the model
+    model = model.to(device=device)
+
+    return model
+
+
+def reset_caches(model: Model):
+    """Reset the caches of the model (used after each generation)."""
+    model.reset_caches()
+    for module in model.modules():
+        if hasattr(module, "cache_enabled"):
+            module.cache_enabled = False
+        if hasattr(module, "kv_cache"):
+            module.kv_cache = None
+
+
+def custom_generator_init(self, model: Model, audio_tokenizer: torch.nn.Module, text_tokenizer):
+    """Custom __init__ for the Generator class (from sesame csm repo)."""
+    self._model = model
+    self._model.setup_caches(1)
+    
+    self._text_tokenizer = text_tokenizer
+    
+    device = next(model.parameters()).device
+    self._audio_tokenizer = audio_tokenizer.to(device=device)
+    self.sample_rate = MIMI_SAMPLE_RATE
+    self.device = device
+    
+    self._watermarker = None  
+
+
+def generate_audio(model, audio_tokenizer, text_tokenizer, text, speaker_id, device, use_amp=True, max_audio_length_ms=10_000):
+    """" Generate audio from text """
+    model.eval()
+    # Patch the Generator's __init__ method on the fly 
+    Generator.__init__ = types.MethodType(custom_generator_init, Generator)
+    generator = Generator(model, audio_tokenizer, text_tokenizer)
+
+    with torch.no_grad(), torch.amp.autocast(device_type=str(device), enabled=use_amp):
+        audio = generator.generate(
+            text = text,
+            speaker = speaker_id,
+            context = [],
+            max_audio_length_ms = max_audio_length_ms,
+        )
+        audio = audio.squeeze().cpu().numpy()
+
+    reset_caches(model)
+    return audio
+
+
+def validate(model, valloader, device, use_amp=True):
+    """ Validate the model on the validation set """
+    model.eval()
+    val_losses = []
+    
+    if valloader is None or len(valloader) == 0:
+        print("No validation data provided.")
+        return float("inf")
+
+
+
+    with torch.no_grad(), torch.amp.autocast(device_type=str(device), enabled=use_amp):
+        for val_tokens, val_tokens_mask in valloader:
+            val_tokens = val_tokens.to(device)
+            val_tokens_mask = val_tokens_mask.to(device)
+            val_loss = model(val_tokens, val_tokens_mask).item()
+            val_losses.append(val_loss)
+
+    avg_val_loss = sum(val_losses) / len(val_losses)
+    return avg_val_loss
+
+
+
 # """
 # Simplified utilities for CSM fine-tuning.
 # """
