@@ -1,0 +1,34 @@
+# --- Paths & Data ---
+data: "./data/peoples_speech"       
+output_dir: "./exp"                   
+model_name_or_checkpoint_path: null
+train_from_scratch: true
+partial_data_loading: true           # true for large datasets (disk streaming)
+num_workers: 4                        
+
+# --- Training Loop ---
+n_epochs: 50
+use_amp: true                        
+log_every: 10                      
+val_every: 100                      
+save_every: 1000                   
+gen_every: 1000                      
+
+# --- Hyperparameters ---
+batch_size: 32
+grad_acc_steps: 1
+learning_rate: 0.003
+weight_decay: 0.002
+warmup_steps: 1000
+lr_decay: "linear"
+decoder_loss_weight: 0.5
+max_grad_norm: 1.3
+
+# --- Generation settings ---
+gen_sentences: "Bird law in this country is not governed by reason." # Text or path to .txt file
+gen_speaker: 999
+
+# --- WandB Settings ---
+wandb_project: "contextual-tts-train"
+wandb_name: null                     
+wandb_reinit: true
