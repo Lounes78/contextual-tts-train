@@ -184,7 +184,7 @@ def load_model(model_name_or_checkpoint_path: Union[str, Path] = None, device: U
 
         if model_name_or_checkpoint_path:
             print(f"Loading checkpoint from {model_name_or_checkpoint_path}")
-            state_dict = torch.load(model_name_or_checkpoint_path, map_location='cpu')['Model']
+            state_dict = torch.load(model_name_or_checkpoint_path, map_location='cpu')['model']
             model.load_state_dict(state_dict)
         else:
             print('Initializing model from scratch')
