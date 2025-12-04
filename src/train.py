@@ -20,6 +20,13 @@ from utils import (
 )
 from dataloaders import create_dataloaders
 
+# DISABLE the buggy cuDNN SDPA backend
+torch.backends.cuda.enable_cudnn_sdp(False)
+
+# ENABLE Flash Attention (best for GH200) and Mem Efficient
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(True)
 
 def load_args():
     config_path = Path(__file__).parent / "train_config.yaml"
@@ -96,7 +103,7 @@ def train(args: argparse.Namespace, device: torch.device, trial: optuna.Trial = 
         for tokens, tokens_mask in trainloader:
             tokens, tokens_mask = tokens.to(device), tokens_mask.to(device)
 
-            with autocast(device_type=str(device), enabled=args.use_amp):
+            with autocast(device_type=str(device), enabled=args.use_amp, dtype=torch.bfloat16):
                 loss = model(tokens, tokens_mask)
                 loss = loss / args.grad_acc_steps
             
@@ -123,13 +130,14 @@ def train(args: argparse.Namespace, device: torch.device, trial: optuna.Trial = 
                     }, step=step
                     )
                 train_losses = []
-            
+            # ------- SAVE ------- 
             if args.save_every and (step % args.save_every == 0 or step == total_steps - 1):
                 state["model"] = model.state_dict()
                 torch.save(state, args.output_dir / f"model_{step}.pt")
                 if step == total_steps - 1:
                     torch.save(state, args.output_dir / f"model_final.pt")
-
+            
+            # ------- VALIDATE -------
             if args.val_every and (step % args.val_every == 0 or step == total_steps - 1):
                 if valloader is not None:
                     val_loss = validate(model, valloader, device, args.use_amp)
@@ -159,28 +167,28 @@ def train(args: argparse.Namespace, device: torch.device, trial: optuna.Trial = 
                         {"train_loss": f"{train_loss:.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"}
                     )
 
+            # # ------- GENERATE -------
+            # if args.gen_every and step % args.gen_every == 0 and not (args.train_from_scratch and step == 0):
+            #     gen_sentences = []
+            #     if isinstance(args.gen_sentences, str):
+            #         gen_sentences.append(args.gen_sentences)
+            #     elif isinstance(args.gen_sentences, Path):
+            #         with open(args.gen_sentences, "r") as f:
+            #             gen_sentences = f.readlines()
 
-            if args.gen_every and step % args.gen_every == 0 and not (args.train_from_scratch and step == 0):
-                gen_sentences = []
-                if isinstance(args.gen_sentences, str):
-                    gen_sentences.append(args.gen_sentences)
-                elif isinstance(args.gen_sentences, Path):
-                    with open(args.gen_sentences, "r") as f:
-                        gen_sentences = f.readlines()
-
-                for i, sentence in enumerate(gen_sentences):
-                    audio = generate_audio(
-                        model,
-                        audio_tokenizer,
-                        text_tokenizer,
-                        sentence,
-                        args.gen_speaker,
-                        device,
-                        use_amp=args.use_amp
-                    )
+            #     for i, sentence in enumerate(gen_sentences):
+            #         audio = generate_audio(
+            #             model,
+            #             audio_tokenizer,
+            #             text_tokenizer,
+            #             sentence,
+            #             args.gen_speaker,
+            #             device,
+            #             use_amp=args.use_amp
+            #         )
                     
-                    wandb.log({f"audio_{i}": wandb.Audio(audio, sample_rate=MIMI_SAMPLE_RATE)}, step=step)
-                model.train()
+            #         wandb.log({f"audio_{i}": wandb.Audio(audio, sample_rate=MIMI_SAMPLE_RATE)}, step=step)
+            #     model.train()
 
             pbar.update(1)
             if total_steps and step >= total_steps:

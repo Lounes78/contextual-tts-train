@@ -14,46 +14,95 @@ AUDIO_NUM_CODEBOOKS = 32
 def build_parquet_index(data_dir: str, split: str) -> Tuple[List[dict], List[int], List[int]]:
     """
     Scans directory for parquet chunks and builds a global index.
+    Auto-discovers subdirectories if data_dir contains multiple dataset directories.
     
     Returns:
         file_infos: List of dicts with file path and start index.
         file_starts: List of start indices (for binary search).
         global_lengths: List of sequence lengths for every sample.
     """
-    # Pattern matches: train_div0_part_001.parquet, train_part_001.parquet, etc.
-    search_path = os.path.join(data_dir, f"{split}*part_*.parquet")
-    files = sorted(glob.glob(search_path))
-    if not files:
-        print(f"Warning: No files found for split '{split}' in {data_dir}")
-        return [], [], []
-
-    print(f"Indexing {len(files)} parquet files for split '{split}'...")
-    
     file_infos = []
     file_starts = []
     global_lengths = []
     current_start = 0
-
-    for f_path in files:
-        try:
-            # We only need the 'length' column to build the index
-            df = pl.scan_parquet(f_path).select("length").collect()
-            n_rows = len(df)
-            lengths = df["length"].to_list()
-            
-            file_infos.append({
-                "path": f_path,
-                "start": current_start,
-                "len": n_rows
-            })
-            file_starts.append(current_start)
-            
-            global_lengths.extend(lengths)
-            current_start += n_rows
-        except Exception as e:
-            print(f"Skipping corrupt file {f_path}: {e}")
+    total_files = 0
+    
+    # Check if data_dir contains subdirectories with parquet files
+    subdirs = [d for d in Path(data_dir).iterdir() if d.is_dir()]
+    
+    if subdirs:
+        print(f"Auto-discovering datasets in {data_dir}")
+        discovered_dirs = []
         
-    return file_infos, file_starts, global_lengths 
+        for subdir in subdirs:
+            search_path = os.path.join(str(subdir), f"{split}*part_*.parquet")
+            subdir_files = sorted(glob.glob(search_path))
+            if subdir_files:
+                discovered_dirs.append(str(subdir))
+        
+        print(f"Found datasets in: {[Path(d).name for d in discovered_dirs]}")
+        
+        # Process each discovered directory
+        for dataset_dir in discovered_dirs:
+            search_path = os.path.join(dataset_dir, f"{split}*part_*.parquet")
+            files = sorted(glob.glob(search_path))
+            
+            print(f"Indexing {len(files)} parquet files for split '{split}' in {Path(dataset_dir).name}...")
+            total_files += len(files)
+            
+            for f_path in files:
+                try:
+                    # We only need the 'length' column to build the index
+                    df = pl.scan_parquet(f_path).select("length").collect()
+                    n_rows = len(df)
+                    lengths = df["length"].to_list()
+                    
+                    file_infos.append({
+                        "path": f_path,
+                        "start": current_start,
+                        "len": n_rows
+                    })
+                    file_starts.append(current_start)
+                    
+                    global_lengths.extend(lengths)
+                    current_start += n_rows
+                except Exception as e:
+                    print(f"Skipping corrupt file {f_path}: {e}")
+    else:
+        # direct search in data_dir
+        search_path = os.path.join(data_dir, f"{split}*part_*.parquet")
+        files = sorted(glob.glob(search_path))
+        total_files = len(files)
+        
+        if not files:
+            print(f"Warning: No files found for split '{split}' in {data_dir}")
+            return [], [], []
+
+        print(f"Indexing {len(files)} parquet files for split '{split}'...")
+        
+        for f_path in files:
+            try:
+                # We only need the 'length' column to build the index
+                df = pl.scan_parquet(f_path).select("length").collect()
+                n_rows = len(df)
+                lengths = df["length"].to_list()
+                
+                file_infos.append({
+                    "path": f_path,
+                    "start": current_start,
+                    "len": n_rows
+                })
+                file_starts.append(current_start)
+                
+                global_lengths.extend(lengths)
+                current_start += n_rows
+            except Exception as e:
+                print(f"Skipping corrupt file {f_path}: {e}")
+    
+    if total_files > 0:
+        print(f"Successfully indexed {total_files} total files with {len(global_lengths)} samples")
+    
+    return file_infos, file_starts, global_lengths
 
 
 

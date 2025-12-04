@@ -233,7 +233,7 @@ def generate_audio(model, audio_tokenizer, text_tokenizer, text, speaker_id, dev
     Generator.__init__ = types.MethodType(custom_generator_init, Generator)
     generator = Generator(model, audio_tokenizer, text_tokenizer)
 
-    with torch.no_grad(), torch.amp.autocast(device_type=str(device), enabled=use_amp):
+    with torch.no_grad():
         audio = generator.generate(
             text = text,
             speaker = speaker_id,
@@ -257,7 +257,7 @@ def validate(model, valloader, device, use_amp=True):
 
 
 
-    with torch.no_grad(), torch.amp.autocast(device_type=str(device), enabled=use_amp):
+    with torch.no_grad():
         for val_tokens, val_tokens_mask in valloader:
             val_tokens = val_tokens.to(device)
             val_tokens_mask = val_tokens_mask.to(device)

@@ -40,7 +40,8 @@ output_*/
 basic_audio.wav
 full_conversation.wav
 context_audio.wav
-
+*.parquet
 # Model files
 *.pt
-*.ckptTRASH/
+*.ckpt
+TRASH/

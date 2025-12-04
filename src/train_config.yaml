@@ -1,23 +1,23 @@
 # --- Paths & Data ---
-data: "./data/peoples_speech"       
-output_dir: "./exp"                   
+data: "/workspace/tokenized/data/peoples_speech"
+output_dir: "./exp2"            ## here         
 model_name_or_checkpoint_path: null
 train_from_scratch: true
-partial_data_loading: true           # true for large datasets (disk streaming)
-num_workers: 4                        
+partial_data_loading: false           # false -> laod everything into ram
+num_workers: 0              
 
 # --- Training Loop ---
 n_epochs: 50
 use_amp: true                        
 log_every: 10                      
-val_every: 100                      
-save_every: 1000                   
-gen_every: 1000                      
+val_every: 5000
+save_every: 20000       
+gen_every: 10000                      
 
 # --- Hyperparameters ---
 batch_size: 32
-grad_acc_steps: 1
-learning_rate: 0.003
+grad_acc_steps: 4  ## here 
+learning_rate: 0.0003   ## here 
 weight_decay: 0.002
 warmup_steps: 1000
 lr_decay: "linear"
