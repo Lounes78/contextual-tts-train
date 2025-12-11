@@ -27,11 +27,9 @@ for ((i=0; i<NUM_DIVS; i++)); do
         tmux new-window -t $SESSION_NAME -n "worker_$i"
     fi
 
-    # Construct the command
     CMD="CUDA_VISIBLE_DEVICES=$GPU_ID python pretokenize_split.py --division $i --num_divisions $NUM_DIVS"
     
     # Send command to the specific window
-    # Target format is session:window_name
     tmux send-keys -t "${SESSION_NAME}:worker_${i}" "$CMD" C-m
     
     echo "  Started Worker $i (Window: worker_$i)"

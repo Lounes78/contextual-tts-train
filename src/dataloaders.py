@@ -242,12 +242,15 @@ class BucketSampler(Sampler):
     """
     def __init__(
             self, lengths: List[int], batch_size: int, shuffle: bool = True,
-            is_infinite: bool = True, random_seed: int = 42
+            is_infinite: bool = True, random_seed: int = 42,
+            num_replicas: int = 1, rank: int = 0
         ):
             self.shuffle = shuffle
             self.batch_size = batch_size
             self.is_infinite = is_infinite
             self.random_seed = random_seed
+            self.num_replicas = num_replicas
+            self.rank = rank
             self.local_step = 0
             self.bins = self._create_bins(lengths, batch_size)
 
@@ -281,7 +284,23 @@ class BucketSampler(Sampler):
             if self.shuffle:
                 self._shuffle_bins(epoch)
 
-            for bin_indices in self.bins:
+            # Distributed subsampling
+            if self.num_replicas > 1:
+                # Deterministically shuffle bins based on epoch before splitting
+                # Actually _shuffle_bins already does that if called.
+                # But we need to ensure all replicas have same bins order before splitting if we want to be safe,
+                # but _shuffle_bins uses fixed seed + epoch, so it should be consistent across ranks.
+                
+                # We select a subset of bins for this rank
+                # We should ensure that we don't drop data if possible, or drop minimal.
+                # Standard DistributedSampler drops the tail.
+                
+                # Simple striding
+                bins_to_yield = self.bins[self.rank::self.num_replicas]
+            else:
+                bins_to_yield = self.bins
+
+            for bin_indices in bins_to_yield:
                 yield bin_indices
                 self.local_step += 1
             
@@ -290,6 +309,8 @@ class BucketSampler(Sampler):
             epoch += 1
 
     def __len__(self):
+        if self.num_replicas > 1:
+            return len(self.bins) // self.num_replicas # Approximation
         return len(self.bins)
 
 
@@ -299,6 +320,8 @@ def create_dataloaders(
     infinite_train: bool = False,
     load_in_memory: bool = False,
     num_workers: int = 4,
+    num_replicas: int = 1,
+    rank: int = 0,
 ):
     """
     Creates training and validation dataloaders from Parquet directory.
@@ -321,7 +344,8 @@ def create_dataloaders(
     if trainset.total_len > 0:
         trainsampler = BucketSampler(
             lengths=trainset._lengths, batch_size=batch_size,
-            is_infinite=infinite_train, shuffle=True
+            is_infinite=infinite_train, shuffle=True,
+            num_replicas=num_replicas, rank=rank
         )
         trainloader = DataLoader(
             trainset, batch_sampler=trainsampler,
@@ -334,9 +358,13 @@ def create_dataloaders(
     # 4. Val Loader
     valloader = None
     if valset.total_len > 0:
+        # Validation usually doesn't need to be distributed if we just run it on rank 0,
+        # but if we want to speed it up we can distribute it.
+        # For simplicity, let's distribute it too.
         valsampler = BucketSampler(
             lengths=valset._lengths, batch_size=batch_size,
-            is_infinite=False, shuffle=False
+            is_infinite=False, shuffle=False,
+            num_replicas=num_replicas, rank=rank
         )
         valloader = DataLoader(
             valset, batch_sampler=valsampler,

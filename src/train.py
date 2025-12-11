@@ -5,6 +5,8 @@ from pathlib import Path
 from tqdm import tqdm
 import optuna
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
 import wandb
@@ -20,7 +22,7 @@ from utils import (
 )
 from dataloaders import create_dataloaders
 
-# DISABLE the buggy cuDNN SDPA backend
+# DISABLE the buggy cuDNN SDPA backend -- need to check this later
 torch.backends.cuda.enable_cudnn_sdp(False)
 
 # ENABLE Flash Attention (best for GH200) and Mem Efficient
@@ -48,25 +50,34 @@ def load_args():
     return args
 
 
-def train(args: argparse.Namespace, device: torch.device, trial: optuna.Trial = None):
-    assert wandb.run is not None, "WandB run must be initialized before calling train()"
+def train(args: argparse.Namespace, device: torch.device, rank: int, world_size: int, trial: optuna.Trial = None):
+    if rank == 0:
+        assert wandb.run is not None, "WandB run must be initialized before calling train()"
     
-    eff_batch_size = args.batch_size * args.grad_acc_steps
+    eff_batch_size = args.batch_size * args.grad_acc_steps * world_size
 
     model = load_model(
         model_name_or_checkpoint_path=args.model_name_or_checkpoint_path,
         device=device,
         decoder_loss_weight=args.decoder_loss_weight
     )
+    
+    if world_size > 1:
+        model = DDP(model, device_ids=[rank])
+
     text_tokenizer, audio_tokenizer = load_tokenizers(device)
 
-    print(f"Initializing dataloaders from {args.data}")
+    if rank == 0:
+        print(f"Initializing dataloaders from {args.data}")
+    
     trainloader, valloader = create_dataloaders(
         token_dataset_dir=args.data, 
         batch_size=args.batch_size, 
         infinite_train=False,
         load_in_memory=not args.partial_data_loading,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        num_replicas=world_size,
+        rank=rank
     )
 
     if trainloader is None:
@@ -84,7 +95,7 @@ def train(args: argparse.Namespace, device: torch.device, trial: optuna.Trial = 
     scaler = GradScaler(enabled=args.use_amp)
 
     state = {
-        "model": model.state_dict(),
+        "model": model.module.state_dict() if world_size > 1 else model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict(),
@@ -96,14 +107,16 @@ def train(args: argparse.Namespace, device: torch.device, trial: optuna.Trial = 
     # training loop
     step = 0
     train_losses = []
-    pbar = tqdm(total=total_steps, desc="Training" if trial is None else f"Trial {trial.number}")
+    if rank == 0:
+        pbar = tqdm(total=total_steps, desc="Training" if trial is None else f"Trial {trial.number}")
+    
     model.train()
 
     for epoch in range(args.n_epochs):
         for tokens, tokens_mask in trainloader:
             tokens, tokens_mask = tokens.to(device), tokens_mask.to(device)
 
-            with autocast(device_type=str(device), enabled=args.use_amp, dtype=torch.bfloat16):
+            with autocast(device_type="cuda", enabled=args.use_amp, dtype=torch.bfloat16):
                 loss = model(tokens, tokens_mask)
                 loss = loss / args.grad_acc_steps
             
@@ -121,7 +134,7 @@ def train(args: argparse.Namespace, device: torch.device, trial: optuna.Trial = 
             train_losses.append(train_loss)
 
 
-            if args.log_every and step % args.log_every == 0:
+            if rank == 0 and args.log_every and step % args.log_every == 0:
                 wandb.log(
                     {
                         "train_loss_avg": sum(train_losses) / len(train_losses),
@@ -131,8 +144,8 @@ def train(args: argparse.Namespace, device: torch.device, trial: optuna.Trial = 
                     )
                 train_losses = []
             # ------- SAVE ------- 
-            if args.save_every and (step % args.save_every == 0 or step == total_steps - 1):
-                state["model"] = model.state_dict()
+            if rank == 0 and args.save_every and (step % args.save_every == 0 or step == total_steps - 1):
+                state["model"] = model.module.state_dict() if world_size > 1 else model.state_dict()
                 torch.save(state, args.output_dir / f"model_{step}.pt")
                 if step == total_steps - 1:
                     torch.save(state, args.output_dir / f"model_final.pt")
@@ -141,28 +154,38 @@ def train(args: argparse.Namespace, device: torch.device, trial: optuna.Trial = 
             if args.val_every and (step % args.val_every == 0 or step == total_steps - 1):
                 if valloader is not None:
                     val_loss = validate(model, valloader, device, args.use_amp)
-                    wandb.log({"val_loss": val_loss}, step=step)
+                    
+                    # Aggregate validation loss across all ranks
+                    if world_size > 1:
+                        val_loss_tensor = torch.tensor(val_loss, device=device)
+                        dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+                        val_loss = val_loss_tensor.item()
 
-                    if val_loss < state["best_val_loss"]:
-                        state["best_val_loss"] = val_loss
-                        torch.save(state, args.output_dir / f"model_bestval.pt")
-                        wandb.save(str(args.output_dir / f"wandb_bestval.pt"))
+                    if rank == 0:
+                        wandb.log({"val_loss": val_loss}, step=step)
 
-                    if trial is not None:
-                        trial.report(val_loss, step)
-                        if trial.should_prune():
-                            wandb.finish()
-                            pbar.close()
-                            raise optuna.exceptions.TrialPruned()
+                        if val_loss < state["best_val_loss"]:
+                            state["best_val_loss"] = val_loss
+                            torch.save(state, args.output_dir / f"model_bestval.pt")
+                            wandb.save(str(args.output_dir / f"wandb_bestval.pt"))
+
+                        if trial is not None:
+                            trial.report(val_loss, step)
+                            if trial.should_prune():
+                                wandb.finish()
+                                pbar.close()
+                                raise optuna.exceptions.TrialPruned()
             
                 model.train()
 
-                if valloader is not None:
-                    pbar.set_postfix({"train_loss": f"{train_loss:.4f}", "val_loss": f"{val_loss:.4f}"})
-                else:
-                    pbar.set_postfix({"train_loss": f"{train_loss:.4f}"})
+                if rank == 0:
+                    if valloader is not None:
+                        pbar.set_postfix({"train_loss": f"{train_loss:.4f}", "val_loss": f"{val_loss:.4f}"})
+                    else:
+                        pbar.set_postfix({"train_loss": f"{train_loss:.4f}"})
 
             else:
+                if rank == 0:
                     pbar.set_postfix(
                         {"train_loss": f"{train_loss:.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"}
                     )
@@ -190,12 +213,15 @@ def train(args: argparse.Namespace, device: torch.device, trial: optuna.Trial = 
             #         wandb.log({f"audio_{i}": wandb.Audio(audio, sample_rate=MIMI_SAMPLE_RATE)}, step=step)
             #     model.train()
 
-            pbar.update(1)
+            if rank == 0:
+                pbar.update(1)
+            
             if total_steps and step >= total_steps:
                 break
             step += 1
     
-    pbar.close()
+    if rank == 0:
+        pbar.close()
     return state["best_val_loss"]
 
 
