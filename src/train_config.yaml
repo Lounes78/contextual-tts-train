@@ -1,6 +1,6 @@
 # --- Paths & Data ---
 data: "/workspace/tokenized/data/peoples_speech"
-output_dir: "./exp2"            ## here         
+output_dir: "./exp3-ddp"            ## here         
 #model_name_or_checkpoint_path: null
 #train_from_scratch: true
 

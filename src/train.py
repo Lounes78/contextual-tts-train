@@ -1,5 +1,11 @@
 import argparse
 import os
+import sys
+
+# Set device visibility before importing torch to ensure strict isolation
+if "LOCAL_RANK" in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["LOCAL_RANK"]
+
 import yaml
 from pathlib import Path
 from tqdm import tqdm
@@ -46,11 +52,34 @@ def load_args():
 
     if args.train_from_scratch: # like this we are sure
         args.model_name_or_checkpoint_path = None
+    else:
+        # Auto-resume: Check if there are any checkpoints in the output directory
+        # and resume from the latest one if found.
+        checkpoints = list(args.output_dir.glob("model_*.pt"))
+        latest_step = -1
+        latest_ckpt = None
+        
+        for ckpt in checkpoints:
+            # Skip special named checkpoints to prefer numbered steps for exact resume
+            if ckpt.name in ["model_final.pt", "model_bestval.pt"]:
+                continue
+            try:
+                # Expected format: model_{step}.pt
+                step = int(ckpt.stem.split("_")[1])
+                if step > latest_step:
+                    latest_step = step
+                    latest_ckpt = ckpt
+            except (ValueError, IndexError):
+                continue
+        
+        if latest_ckpt:
+            print(f"Auto-resume: Found latest checkpoint in output_dir: {latest_ckpt}")
+            args.model_name_or_checkpoint_path = str(latest_ckpt)
 
     return args
 
 
-def train(args: argparse.Namespace, device: torch.device, rank: int, world_size: int, trial: optuna.Trial = None):
+def train(args: argparse.Namespace, device: torch.device, rank: int, world_size: int, ddp_device_ids: list = None, trial: optuna.Trial = None):
     if rank == 0:
         assert wandb.run is not None, "WandB run must be initialized before calling train()"
     
@@ -63,16 +92,11 @@ def train(args: argparse.Namespace, device: torch.device, rank: int, world_size:
     )
     
     if world_size > 1:
-        model = DDP(model, device_ids=[rank])
+        model = DDP(model, device_ids=ddp_device_ids)
 
-    text_tokenizer, audio_tokenizer = load_tokenizers(device)
-
-    if rank == 0:
-        print(f"Initializing dataloaders from {args.data}")
-    
     trainloader, valloader = create_dataloaders(
-        token_dataset_dir=args.data, 
-        batch_size=args.batch_size, 
+        token_dataset_dir=args.data,
+        batch_size=args.batch_size,
         infinite_train=False,
         load_in_memory=not args.partial_data_loading,
         num_workers=args.num_workers,
@@ -80,37 +104,47 @@ def train(args: argparse.Namespace, device: torch.device, rank: int, world_size:
         rank=rank
     )
 
-    if trainloader is None:
-        raise ValueError("Training dataloader is None.")
-
-    total_steps = args.n_epochs * len(trainloader) # One update per batch
-
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
-        weight_decay=args.weight_decay
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.95)
     )
 
-    scheduler = WarmupDecayLR(optimizer, args.warmup_steps, total_steps, args.lr_decay)
-    scaler = GradScaler(enabled=args.use_amp)
+    total_steps = len(trainloader) * args.n_epochs
+    scheduler = WarmupDecayLR(
+        optimizer,
+        warmup_steps=args.warmup_steps,
+        total_steps=total_steps,
+        decay_type=args.lr_decay
+    )
 
+    step = 0
+    if args.model_name_or_checkpoint_path and str(args.model_name_or_checkpoint_path).endswith(".pt"):
+        print(f"Resuming training state from {args.model_name_or_checkpoint_path}")
+        # Load to CPU first to avoid extra GPU memory usage
+        checkpoint = torch.load(args.model_name_or_checkpoint_path, map_location="cpu")
+        
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if "scheduler" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler"])
+        if "step" in checkpoint:
+            step = checkpoint["step"]
+            print(f"Resuming from step {step}")
+
+    train_losses = []
+    
     state = {
         "model": model.module.state_dict() if world_size > 1 else model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
-        "scaler": scaler.state_dict(),
-        "effective_batch_size": eff_batch_size,
-        "args": vars(args), 
+        "step": 0,
         "best_val_loss": float("inf"),
-    }   
+    }
 
-    # training loop
-    step = 0
-    train_losses = []
     if rank == 0:
-        pbar = tqdm(total=total_steps, desc="Training" if trial is None else f"Trial {trial.number}")
-    
-    model.train()
+        pbar = tqdm(total=total_steps, desc="Training")
 
     for epoch in range(args.n_epochs):
         for tokens, tokens_mask in trainloader:
@@ -120,18 +154,19 @@ def train(args: argparse.Namespace, device: torch.device, rank: int, world_size:
                 loss = model(tokens, tokens_mask)
                 loss = loss / args.grad_acc_steps
             
-            scaler.scale(loss).backward() # backprop safely in mixed precision by scaling the loss first
+            loss.backward()
 
             if (step + 1) % args.grad_acc_steps == 0:
-                scaler.unscale_(optimizer) # unscale the gradients before clipping
                 clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                scaler.step(optimizer) # aka optimizer.step() safely 
-                scaler.update() # adjust the scale for next iteration
+                optimizer.step()
                 optimizer.zero_grad()
                 scheduler.step() # update lr schedule by 1 step
             
             train_loss = loss.item()
             train_losses.append(train_loss)
+            
+            # Clear cache to prevent OOM
+            torch.cuda.empty_cache()
 
 
             if rank == 0 and args.log_every and step % args.log_every == 0:
@@ -229,17 +264,40 @@ def train(args: argparse.Namespace, device: torch.device, rank: int, world_size:
 if __name__ == "__main__":
     args = load_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on: {device}")
+    # DDP setup
+    ddp_device_ids = None
+    if "LOCAL_RANK" in os.environ:
+        # We already set CUDA_VISIBLE_DEVICES at the top of the file
+        # so each process only sees one GPU, which is always cuda:0
+        
+        dist.init_process_group(backend="nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ["LOCAL_RANK"])
+        
+        device = torch.device("cuda:0")
+        ddp_device_ids = [0]
+        print(f"Rank {rank}/{world_size} initialized on {device} (Physical GPU {local_rank})")
+    else:
+        rank = 0
+        world_size = 1
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Training on: {device}")
 
-    wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_name or f"training_bs-{args.batch_size}x{args.grad_acc_steps}",
-        notes=f"Config loaded from file",
-        config=vars(args), # Namespace to dict for WandB
-        reinit=args.wandb_reinit,
-        dir=args.output_dir / "wandb",
-    )
+    if rank == 0:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_name or f"training_bs-{args.batch_size}x{args.grad_acc_steps}",
+            notes=f"Config loaded from file",
+            config=vars(args), # Namespace to dict for WandB
+            reinit=args.wandb_reinit,
+            dir=args.output_dir / "wandb",
+        )
 
-    final_val_loss = train(args, device)
-    wandb.finish()
+    final_val_loss = train(args, device, rank, world_size, ddp_device_ids)
+    
+    if rank == 0:
+        wandb.finish()
+    
+    if world_size > 1:
+        dist.destroy_process_group()
