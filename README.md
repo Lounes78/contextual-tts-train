@@ -5,12 +5,26 @@ Real-time text-to-speech using CSM-1B with proper streaming.
 ## Quick Start
 
 ```bash
+pip install -r requirements.txt
 python server.py
 ```
 
 Open browser to `http://localhost:8998`
 
 Type some text, click generate. Audio plays in real-time.
+
+## Docker (Pre-configured Image)
+
+A ready-to-use Docker image `csm-stream` is available with all dependencies and the environment already set up *on the gh200*
+
+### Launch Command
+
+```bash
+docker run --gpus all -p 8998:8998 -v /home/az03732:/home/az03732 csm-stream
+```
+
+
+Once running, open your browser to `http://localhost:8998`.
 
 ## What Makes It Stream
 
