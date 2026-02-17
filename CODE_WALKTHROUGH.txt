@@ -1,0 +1,668 @@
+REAL-TIME STREAMING TTS - COMPLETE CODE EXECUTION WALKTHROUGH
+================================================================
+
+This document traces the exact execution path through the code, step by step,
+from when you click "Generate Speech" to when audio plays in your browser.
+
+
+PART 1: SERVER STARTUP
+=======================
+
+File: server.py
+Line 63-108: startup_event()
+
+When you run `python server.py`, this happens:
+
+1. FastAPI starts
+2. The startup_event() function runs BEFORE accepting any connections
+3. Line 72: Check if CUDA is available
+   - torch.cuda.is_available() returns True/False
+   - Sets device to "cuda" or "cpu"
+
+4. Line 77: load_csm_1b(device) is called
+   
+   Goes to: model_loader.py
+   Line 42-60: load_csm_1b()
+   
+   - Line 45: Loads the backbone model (CSM-1B transformer)
+   - Line 49: Loads the audio decoder (converts tokens to audio)
+   - Line 54: Creates TokenGenerator wrapper
+   - Returns the generator object
+   
+   Back to server.py line 77: generator = load_csm_1b(...)
+
+5. Line 81-86: Prepare speaker prompt
+   - prepare_prompt() loads a reference audio file
+   - This audio defines the voice characteristics
+   - Stored in prompt_context variable
+
+6. Line 91-99: Warmup generation
+   - Runs a dummy generation with text "Warmup."
+   - Purpose: Compile PyTorch CUDA kernels
+   - First generation is always slow (compilation)
+   - After warmup, subsequent generations are fast
+   - The for loop consumes the generator: for _ in generator.generate_stream(...)
+   - We don't use the audio, just trigger compilation
+
+7. Line 100-101: torch.cuda.synchronize()
+   - Ensures all CUDA operations finish
+   - Blocks until GPU is idle
+
+8. Server is now ready at http://0.0.0.0:8998
+
+
+PART 2: CLIENT LOADS
+=====================
+
+File: client.html
+
+When you open http://localhost:8998 in your browser:
+
+1. server.py line 110-125: get_client()
+   - FastAPI serves client.html
+   - Browser downloads and renders the HTML
+
+2. client.html line 578-581: window.onload
+   - Runs when page finishes loading
+   - Calls initWebSocket()
+
+3. client.html line 374-393: initWebSocket()
+   - Line 376: Builds WebSocket URL: ws://localhost:8998/ws/generate
+   - Line 378: Creates WebSocket connection
+   - ws = new WebSocket(wsUrl)
+   
+4. Line 380-383: ws.onopen callback
+   - Fires when connection established
+   - Updates status to "Connected"
+   - Logs to console
+   
+5. Line 385-389: ws.onclose callback
+   - Registered for later if connection drops
+   - Will auto-reconnect after 3 seconds
+
+Server receives WebSocket connection:
+- server.py line 137: websocket_generate() function called
+- Line 139: await websocket.accept()
+- Connection is now open and waiting for messages
+
+
+PART 3: USER CLICKS "GENERATE SPEECH"
+======================================
+
+File: client.html line 538-563: generate()
+
+When you click the "Generate Speech" button:
+
+1. Line 539: Get text from textarea
+   const text = document.getElementById('textInput').value.trim()
+   Example: "Hello! This is a test."
+
+2. Line 540-543: Validate
+   - Check text is not empty
+   - Check WebSocket is connected
+   - If not, show alert and return
+
+3. Line 550-556: Prepare request data
+   const temperature = 0.9
+   const topk = 50
+   
+4. Line 558-562: Send JSON to server
+   ws.send(JSON.stringify({
+       text: "Hello! This is a test.",
+       temperature: 0.9,
+       topk: 50
+   }))
+   
+   This sends bytes over the network through WebSocket.
+
+
+PART 4: SERVER RECEIVES TEXT
+=============================
+
+File: server.py line 143-160
+
+The async websocket_generate() function is waiting at line 144:
+
+1. Line 144: data = await websocket.receive_json()
+   - This line was blocking, waiting for a message
+   - Now it receives: {"text": "Hello! This is a test.", "temperature": 0.9, "topk": 50}
+   - Parses JSON into Python dict
+
+2. Line 145-147: Extract values
+   text = "Hello! This is a test."
+   temperature = 0.9
+   topk = 50
+
+3. Line 149-151: Validation
+   if not text:
+       await websocket.send_json({"error": "No text provided"})
+       continue
+   Skipped in our case (text is valid)
+
+4. Line 153: Print to server console
+   "Generating audio for: Hello! This is a test..."
+
+5. Line 156-160: Send "start" signal back to client
+   await websocket.send_json({
+       "type": "start",
+       "text": text,
+       "sample_rate": 24000
+   })
+   
+   This JSON is sent through WebSocket back to browser.
+
+
+PART 5: CLIENT RECEIVES "START" SIGNAL
+=======================================
+
+File: client.html line 395-420
+
+The ws.onmessage callback fires:
+
+1. Line 396: const data = JSON.parse(event.data)
+   Receives: {"type": "start", "text": "Hello! This is a test.", "sample_rate": 24000}
+
+2. Line 398: if (data.type === 'start')
+   True, so enters this block
+
+3. Line 399: log(`Starting generation: ${data.text}...`)
+   Logs to browser console and UI
+
+4. Line 400: sampleRate = data.sample_rate
+   Stores 24000 for later use
+
+5. Line 401: audioChunks = []
+   Clears any previous chunks
+
+6. Line 402-403: Show metrics panel
+   document.getElementById('metricsPanel').style.display = 'block'
+
+7. Line 406-410: Initialize Web Audio API
+   if (!audioContext || audioContext.state === 'closed') {
+       audioContext = new AudioContext({ sampleRate: 24000 });
+   }
+   
+   Creates the audio context (this is the browser's audio engine)
+
+8. Line 413-415: Resume if suspended
+   if (audioContext.state === 'suspended') {
+       await audioContext.resume();
+   }
+   
+   Browser requires user interaction before allowing audio
+   (clicking the button counts as interaction)
+
+9. Line 418: nextStartTime = 0
+   Resets timing for chunk scheduling
+
+Client is now ready to receive audio chunks.
+
+
+PART 6: SERVER GENERATES AUDIO (THE CRITICAL PART)
+===================================================
+
+File: server.py line 167-212
+
+1. Line 167: for audio_chunk in generator.generate_stream(...)
+   
+   This calls the generator. Let's follow into the generator code.
+   
+   Goes to: token_generator.py line 113-262
+   
+   File: token_generator.py
+   
+   2. Line 113: def generate_stream(self, text, speaker, context, ...)
+      Function is called with our parameters
+   
+   3. Line 127-129: Initialize session
+      session_id = "4c1d2e01" (random)
+      print("[Gen-4c1d2e01] Starting generate_stream for text: 'Hello! This is a test...'")
+      yield_count = 0
+   
+   4. Line 138: self._model.reset_caches()
+      Clears KV caches from previous generation
+   
+   5. Line 143-144: Calculate max frames to generate
+      estimated_frames = max(int(len(text) * 2.5), 50)
+      For "Hello! This is a test." (23 chars): ~58 frames
+      max_generation_len = min(1500, 58) = 58
+   
+   6. Line 147-156: Tokenize input text
+      - Converts "Hello! This is a test." to token IDs
+      - Example: [0, 3823, 0, 115, 23, 374, 264, 1296, 13, 0]
+      - Each token represents a word or subword
+   
+   7. Line 158-163: Concatenate with context (speaker prompt)
+      - Combines prompt tokens + text tokens
+      - Creates long sequence: [prompt_tokens..., text_tokens...]
+   
+   8. Line 165-167: Convert to tensors and move to GPU
+      prompt_tokens = torch.cat(tokens).to(device)
+      prompt_tokens is now on CUDA device
+   
+   9. Line 175-178: Initialize buffering
+      buffer_size = 15  # frames
+      frame_buffer = []
+      first_chunk_delivered = False
+   
+   10. Line 187: with self.audio_decoder.streaming_context(1):
+       Enters streaming mode for decoder
+   
+   11. Line 188: for i in range(max_generation_len):
+       Start autoregressive generation loop
+       Will generate up to 58 frames
+   
+   12. Line 190-192: Generate ONE frame
+       sample = self._model.generate_frame(
+           curr_tokens, curr_tokens_mask, curr_pos, temperature, topk
+       )
+       
+       This is the model forward pass:
+       - Input: current tokens, position, masks
+       - Model predicts: next audio frame (8 codebook values)
+       - Sample is shape [1, 8] (1 frame, 8 codebooks)
+       - Takes ~50-150ms on GPU
+   
+   13. Line 195: Check if End-of-Sequence
+       if torch.all(sample == 0):
+       
+       If all codebook values are 0, generation should stop
+       This won't happen yet (we're still generating)
+   
+   14. Line 207: update_tokens(sample)
+       Updates curr_tokens to include the new frame
+       Shifts position forward by 1
+   
+   15. Line 208: frame_buffer.append(sample)
+       Adds frame to buffer
+       frame_buffer now has 1 frame
+   
+   16. Loop repeats steps 12-15
+       After iteration 2: frame_buffer has 2 frames
+       After iteration 3: frame_buffer has 3 frames
+       ...
+       After iteration 15: frame_buffer has 15 frames
+   
+   17. Line 211: if len(frame_buffer) >= buffer_size:
+       True! We have 15 frames (buffer_size = 15)
+       
+   18. Line 212: yield_count += 1 (now = 1)
+   
+   19. Line 213: Print log
+       "[Gen-4c1d2e01] Yield #1: Flushing 15 frames"
+   
+   20. Line 214: Stack frames
+       frames_stacked = torch.stack(frame_buffer).squeeze(1)
+       Shape: [15, 8] (15 frames, 8 codebooks each)
+   
+   21. Line 215: Decode to audio
+       audio_chunk = self.audio_decoder.decode(frames_stacked)
+       
+       Goes to: decoding.py
+       The decoder converts 15 frames to ~28,800 audio samples
+       Each frame = 80ms = 1920 samples at 24kHz
+       15 frames = 1.2 seconds of audio
+       Returns tensor of shape [28800]
+       
+   22. Line 218: cpu_chunk = audio_chunk.cpu()
+       Moves from GPU memory to CPU memory
+       This is necessary before sending to client
+   
+   23. Line 221: frame_buffer = []
+       CRITICAL: Clear the buffer for next chunk
+   
+   24. Line 226: yield cpu_chunk
+       YIELDS CONTROL BACK TO SERVER
+       
+       This is the key line. The generator pauses here and returns
+       the cpu_chunk to the caller (server.py line 167)
+
+Back to server.py line 167:
+
+The for loop receives audio_chunk = cpu_chunk (28,800 samples)
+
+25. server.py line 168: chunk_count[0] += 1 (now = 1)
+
+26. Line 171: current_time = asyncio.get_event_loop().time()
+    Gets current time for metrics
+
+27. Line 173-175: First chunk timing
+    if first_chunk_time[0] is None:
+        first_chunk_time[0] = current_time - start_time
+        print(f"First chunk latency: {750.0}ms")
+
+28. Line 177-180: Convert to numpy
+    if isinstance(audio_chunk, torch.Tensor):
+        audio_np = audio_chunk.cpu().numpy() if audio_chunk.is_cuda else audio_chunk.numpy()
+    
+    audio_np is now a numpy array: [28800] float32 values between -1 and 1
+
+29. Line 183-184: Log chunk size
+    chunk_duration = 28800 / 24000 = 1.20 seconds
+    print(f"Chunk 1: 28800 samples (1.20s)")
+
+30. Line 187: Convert to WAV format
+    wav_bytes = audio_to_wav_bytes(audio_np, 24000)
+    
+    Goes to: server.py line 47-61
+    
+    - Line 50: Normalize to 16-bit integers
+      audio_int = (audio_np * 32767).astype(np.int16)
+    
+    - Line 54-59: Create WAV file in memory
+      Uses wave library to create proper WAV header
+      Mono (1 channel), 16-bit, 24000 Hz
+      
+    - Returns bytes object (WAV file content)
+    
+    wav_bytes is now ~57KB (28800 samples × 2 bytes + 44 byte header)
+
+31. Line 200-202: Encode to base64
+    import base64
+    audio_b64 = base64.b64encode(wav_bytes).decode('utf-8')
+    
+    Converts binary WAV data to text string (base64 encoding)
+    This allows sending binary data through JSON
+    audio_b64 is now a string of ~76KB
+
+32. Line 203-208: Send to client via WebSocket
+    await websocket.send_json({
+        "type": "audio_chunk",
+        "data": audio_b64,
+        "chunk_id": 1,
+        "sample_rate": 24000
+    })
+    
+    THIS IS THE CRITICAL LINE FOR STREAMING!
+    
+    The `await` keyword means:
+    - Serialize the dict to JSON
+    - Send JSON bytes through WebSocket
+    - Wait for network send to complete
+    - Yield control to asyncio event loop
+    
+    The data travels through:
+    - Server Python → OS network stack → TCP/IP → Network → Browser
+    
+    This takes ~5-20ms on localhost
+
+33. Line 209: print(f"[Server] Sent chunk 1 to client")
+
+34. Line 212: await asyncio.sleep(0.001)
+    
+    CRITICAL LINE!
+    
+    Sleeps for 1 millisecond (0.001 seconds)
+    
+    Why? This gives the asyncio event loop time to:
+    - Process the WebSocket send
+    - Handle any incoming messages
+    - Do other async tasks
+    - Not block everything
+    
+    Without this, the loop might generate next chunk before
+    the network has time to actually send the previous chunk.
+
+35. Back to generator: for loop continues
+    
+    The for loop on line 167 continues, which calls the generator again.
+    
+    Goes back to: token_generator.py line 188
+    
+    The generator resumes right after the yield on line 226.
+    
+36. Line 227: print("[Gen-4c1d2e01] RETURNED from yield #1, continuing loop...")
+
+37. Line 229-238: Adaptive buffering
+    if not first_chunk_delivered:
+        buffer_size = 25
+        first_chunk_delivered = True
+    
+    Now buffer_size = 25 (increased from 15)
+    Next chunk will have 25 frames = 2.0 seconds
+
+38. Loop continues at line 188: for i in range(max_generation_len):
+    i is now 16 (we already did 0-14)
+    
+    Generates frames 16, 17, 18, ... 40
+    After 25 more frames, buffer triggers again
+
+39. Line 211: if len(frame_buffer) >= buffer_size:
+    True! frame_buffer has 25 frames
+    
+40. Lines 212-226: Same process as before
+    - Stack frames: [25, 8]
+    - Decode to audio: 48,000 samples (2.0 seconds)
+    - Move to CPU
+    - Clear buffer
+    - yield cpu_chunk
+
+Back to server.py line 167: Receives chunk 2
+
+41. Repeat steps 25-34 for chunk 2
+    - chunk_count = 2
+    - 48,000 samples
+    - Convert to WAV (~96KB)
+    - Encode base64
+    - await send
+    - await sleep(0.001)
+
+This continues until generation finishes.
+
+42. At some point, the model generates frame with all zeros
+    (End-of-Sequence signal)
+    
+    token_generator.py line 195: if torch.all(sample == 0):
+    True!
+    
+43. Line 197-207: Flush remaining frames
+    if frame_buffer:
+        frames_stacked = torch.stack(frame_buffer).squeeze(1)
+        audio_chunk = self.audio_decoder.decode(frames_stacked)
+        cpu_chunk = audio_chunk.cpu()
+        frame_buffer = []  # Clear to prevent duplicate
+        yield cpu_chunk
+    
+    Yields the final chunk with remaining frames
+
+44. Line 208: break
+    Exits the generation loop
+
+45. Line 256: print("[Gen-4c1d2e01] Generator complete. Total chunks: 3")
+
+46. Generator function ends, returns to server.py
+
+Back to server.py line 167:
+
+The for loop has no more items to iterate (generator finished).
+Exits the for loop.
+
+47. Line 214: print(f"[Server] Generation complete, sent 3 chunks")
+
+48. Line 217-223: Send completion signal
+    total_time = 9.81  # seconds
+    await websocket.send_json({
+        "type": "complete",
+        "chunks": 3,
+        "total_time": 9.81,
+        "first_chunk_latency": 0.75
+    })
+
+Server is done! Now let's see what happened on the client side while this was happening.
+
+
+PART 7: CLIENT RECEIVES AND PLAYS CHUNKS
+=========================================
+
+File: client.html
+
+REMEMBER: While the server was generating, chunks were arriving in real-time.
+
+When first chunk arrives (after ~750ms):
+
+1. Line 395: ws.onmessage callback fires
+   event.data contains JSON string
+
+2. Line 396: const data = JSON.parse(event.data)
+   data = {"type": "audio_chunk", "data": "UklGR...", "chunk_id": 1, "sample_rate": 24000}
+
+3. Line 422: else if (data.type === 'audio_chunk')
+   True! Enters this block
+
+4. Line 424: Decode base64
+   const wavBytes = Uint8Array.from(atob(data.data), c => c.charCodeAt(0))
+   
+   atob() decodes base64 string to binary string
+   Uint8Array.from() converts to byte array
+   wavBytes is now Uint8Array of ~57KB (WAV file bytes)
+
+5. Line 427: audioChunks.push(wavBytes)
+   Stores for later download (not used for playback)
+
+6. Line 430-434: Logging
+   console.log(`Chunk 1 received: 57600 bytes`)
+   log(`Chunk 1 received (56.3KB)`)
+
+7. Line 437: playAudioChunk(wavBytes, 1)
+   
+   THIS IS WHERE REAL-TIME PLAYBACK HAPPENS!
+   
+   Goes to: client.html line 478-519
+   
+   8. Line 489: Decode WAV to AudioBuffer
+      const audioBuffer = await audioContext.decodeAudioData(wavBytes.buffer.slice(0))
+      
+      Browser's audio decoder:
+      - Parses WAV header
+      - Extracts PCM data
+      - Converts to Float32Array
+      - Creates AudioBuffer object
+      
+      audioBuffer properties:
+      - duration: 1.2 seconds
+      - sampleRate: 24000
+      - numberOfChannels: 1
+      - length: 28800 samples
+      
+      This takes ~5-20ms
+   
+   9. Line 492-495: Create audio source
+      const source = audioContext.createBufferSource()
+      source.buffer = audioBuffer
+      source.connect(audioContext.destination)
+      
+      Creates a playback node and connects to speakers
+   
+   10. Line 498: const currentTime = audioContext.currentTime
+       Gets audio clock time (high precision)
+       Example: 2.345 seconds (since AudioContext was created)
+   
+   11. Line 500-502: Calculate start time
+       if (nextStartTime === 0 || nextStartTime < currentTime) {
+           nextStartTime = currentTime + 0.05
+       }
+       
+       First chunk: nextStartTime = 0, so:
+       nextStartTime = 2.345 + 0.05 = 2.395
+       
+       The 0.05 (50ms) is a safety buffer to prevent audio glitches
+   
+   12. Line 505: source.start(nextStartTime)
+       
+       SCHEDULES PLAYBACK AT PRECISE TIME!
+       
+       This tells the browser:
+       "Start playing this audio at exactly 2.395 seconds on the audio clock"
+       
+       The audio will start playing in 50ms from now.
+   
+   13. Line 506: console.log(`Chunk 1 playing at 2.40s, duration 1.20s`)
+   
+   14. Line 509: nextStartTime = nextStartTime + audioBuffer.duration
+       nextStartTime = 2.395 + 1.2 = 3.595
+       
+       This is when the next chunk should start playing
+
+AUDIO IS NOW PLAYING! You hear "Hello! This is..."
+
+While chunk 1 is playing, the server is generating chunk 2.
+
+When chunk 2 arrives (~2 seconds later):
+
+Same process:
+1. ws.onmessage fires
+2. Decode base64 → wavBytes (96KB)
+3. playAudioChunk(wavBytes, 2)
+4. Decode to AudioBuffer (2.0 seconds)
+5. Create source, connect to speakers
+6. currentTime is now ~3.5 (chunk 1 has been playing for 1 second)
+7. nextStartTime = 3.595 (already set by chunk 1)
+8. source.start(3.595)
+   
+   Chunk 2 is scheduled to start at 3.595 seconds
+   Chunk 1 ends at 3.595 seconds (2.395 + 1.2)
+   
+   SEAMLESS! No gap between chunks.
+
+9. nextStartTime = 3.595 + 2.0 = 5.595
+
+Chunk 2 plays: "a test of the real..."
+
+When chunk 3 arrives (~4 seconds later):
+
+1. Decode to AudioBuffer (varies)
+2. source.start(5.595)
+3. Plays: "time streaming system."
+
+When "complete" message arrives:
+
+1. Line 449: else if (data.type === 'complete')
+   True!
+
+2. Line 450-453: Update UI
+   isGenerating = false
+   updateStatus('connected', 'Connected')
+   Enable generate button
+   Disable stop button
+
+3. Line 456-461: Update metrics
+   document.getElementById('firstChunkLatency').textContent = "750ms"
+   document.getElementById('totalTime').textContent = "9.81s"
+
+4. Line 463: log(`Generation complete: 3 chunks in 9.81s`, 'success')
+
+5. Line 466: createDownloadableAudio()
+   Creates audio player with downloadable file (optional)
+
+
+SUMMARY OF WHAT MADE IT REAL-TIME
+==================================
+
+1. SERVER SIDE:
+   - Generator yields chunks as soon as ready (not waiting for all)
+   - for chunk in generator: immediately processes each yield
+   - await websocket.send_json(): sends immediately
+   - await asyncio.sleep(0.001): gives network time to send
+
+2. CLIENT SIDE:
+   - ws.onmessage fires as soon as chunk arrives (not buffering)
+   - playAudioChunk() plays immediately (not waiting for completion)
+   - Web Audio API scheduling: precise timing with nextStartTime
+   - Each chunk scheduled to start exactly when previous ends
+
+3. KEY INSIGHT:
+   While chunk 1 is PLAYING (1.2 seconds),
+   server is GENERATING chunk 2 (2.0 seconds).
+   
+   Timeline:
+   0.0s: Start generation
+   0.75s: Chunk 1 sent, starts playing
+   1.95s: Chunk 1 still playing, chunk 2 sent
+   2.0s: Chunk 1 ends, chunk 2 starts (seamless!)
+   3.0s: Chunk 2 playing, chunk 3 sent
+   4.0s: Chunk 2 ends, chunk 3 starts
+   5.0s: All done
+   
+   User hears continuous audio, not silence then burst of sound!
+
+This is real-time streaming: generation, transmission, and playback overlap.
