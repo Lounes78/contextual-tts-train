@@ -15,7 +15,7 @@ Type some text, click generate. Audio plays in real-time.
 
 ## Docker (Pre-configured Image)
 
-A ready-to-use Docker image `csm-stream` is available with all dependencies and the environment already set up *on the gh200*
+A ready-to-use Docker image `csm-stream` is available with all dependencies and the environment already set up *on the gh200* if not deleted.
 
 ### Launch Command
 
