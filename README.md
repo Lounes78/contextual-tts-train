@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 # CSM-1B Streaming TTS
 
 Real-time text-to-speech using CSM-1B with proper streaming.
